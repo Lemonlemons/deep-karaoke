@@ -12,16 +12,18 @@ class DNN1Model(BaseModel):
   def build(self, stats):
     # dnn frame level
     # self.spectograms_shape = (1025, )
-    self.spectograms_shape = (20, 1025)
+    self.spectograms_shape = (5, 1025)
     # dnn utterance level
     # self.fbanks_shape = (451, 21, 48)
     # dnn number of cells
     self.n_cells = np.prod(self.spectograms_shape)
+    # ddn number of output cells
+    self.n_classes = self.n_cells
     # batch size
     if self.is_testing or self.is_training:
-      self.batch_size = 1
+      self.batch_size = 512
     elif self.is_generating:
-      self.batch_size = 100
+      self.batch_size = 10
     else:
       self.batch_size = 1
     self.keep_prob = 1.0 if self.is_training else 1.0
@@ -41,17 +43,22 @@ class DNN1Model(BaseModel):
       print('second set count: ' + str(SECOND_SET_COUNT))
 
       # make them into "magnitude spectograms"
-      ABS_SPECTOGRAMS = tf.abs(self.SPECTOGRAMS)
+      self.CORRECTED_SPECTOGRAMS = tf.abs(self.SPECTOGRAMS)
 
-      # normalize them based on each frames individual maximum
-      self.max_array = tf.reduce_max(ABS_SPECTOGRAMS, axis=1, keep_dims=True)
-      self.NORM_SPECTOGRAMS = ABS_SPECTOGRAMS / self.max_array
+      # # normalize them based on each frames individual maximum
+      # self.max_array = tf.reduce_max(ABS_SPECTOGRAMS, axis=1, keep_dims=True)
+      # self.NORM_SPECTOGRAMS = ABS_SPECTOGRAMS / self.max_array
+      #
+      # # handle NAN's (basically when the maximum in a frame is zero) (can also be handled when creating the data)
+      # nan_array = tf.is_nan(self.NORM_SPECTOGRAMS)
+      # self.CORRECTED_SPECTOGRAMS = tf.where(nan_array,
+      #                                       x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)], tf.float64),
+      #                                       y=self.NORM_SPECTOGRAMS)
 
-      # handle NAN's (basically when the maximum in a frame is zero) (can also be handled when creating the data)
-      nan_array = tf.is_nan(self.NORM_SPECTOGRAMS)
-      self.CORRECTED_SPECTOGRAMS = tf.where(nan_array,
-                                            x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)], tf.float64),
-                                            y=self.NORM_SPECTOGRAMS)
+      # Dual Mask
+      # self.CORRECTED_SPECTOGRAMS = tf.abs(self.SPECTOGRAMS)
+      # non_vocal_masks = tf.subtract(tf.cast(1.0, tf.float64), self.MASKS)
+      # self.MASKS = tf.concat([self.MASKS, non_vocal_masks], axis=1)
 
       # Build feedforward layers.
       # This first layer is supposed to be a "locally_connected" layer however tensorflow doesn't have an implementation of that.
@@ -62,7 +69,7 @@ class DNN1Model(BaseModel):
       with tf.variable_scope('fully_connected_3') as scope:
         H_3 = fc_dropout_layer(H_2, self.n_cells, self.n_cells, scope, self.keep_prob, is_training=self.is_training, act_func=selu)
       with tf.variable_scope('fully_connected_4') as scope:
-        self.LOGITS = fc_layer(H_3, self.n_cells, self.n_cells, scope, is_training=self.is_training)
+        self.LOGITS = fc_layer(H_3, self.n_cells, self.n_classes, scope, is_training=self.is_training)
       self.Y = tf.nn.sigmoid(self.LOGITS)
 
       print(self.LOGITS.shape)

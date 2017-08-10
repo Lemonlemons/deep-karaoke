@@ -1,4 +1,4 @@
-import ConfigParser
+import configparser
 import argparse
 import os
 
@@ -34,8 +34,9 @@ def main(argv):
     'FFT_SIZE': 2048,
     'HOP_SIZE': 512,
     'SAMPLE_RATE': 44100,
-    'STACKED_FRAMES': 20,
-    'SAMPLE_HOP': 60
+    'STACKED_FRAMES': 5,
+    'SAMPLE_HOP': 10,
+    'WINDOW_SIZE': 1025 * 5
   }
 
   # Train the model
@@ -53,9 +54,9 @@ def main(argv):
   # generate the training data for dnn2
   elif args.phase == 'gen':
     stats = prepare_train_and_test_data(configs, args)
-    _, _, set_one_count, set_two_count = stats
+    set_one_count, set_two_count = stats
     model = create_model(args, stats, configs)
-    model.gen(configs['TF_RECORDS_GEN'], configs['GEN_META_FILE'], set_two_count)
+    model.gen(configs['TF_RECORDS_GEN'], configs['GEN_META_FILE'], configs['STACKED_FRAMES'], set_two_count)
 
   # validate the model
   elif args.phase == 'val':
@@ -63,14 +64,14 @@ def main(argv):
     stats, spectrograms = prepare_val_data(configs)
 
     # process with first model
-    args.model = 'dnn1_multi'
-    first_model = DNN1ModelMultiGpu(args, stats, None)
+    args.model = 'dnn1'
+    first_model = DNN1Model(args, stats, None)
     combo_matrices, phase_components = first_model.get_second_model_input(spectrograms, configs)
 
     # process with second model
-    args.model = 'dnn2_multi'
+    args.model = 'dnn2'
     stats = get_stats(configs['GEN_META_FILE'])
-    second_model = DNN2ModelMultiGpu(args, stats, None)
+    second_model = DNN2Model(args, stats, None)
     second_model.refine_matrices_and_output(combo_matrices, phase_components, configs, stats)
     print('Validation Done!')
 

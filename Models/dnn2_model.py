@@ -11,14 +11,15 @@ class DNN2Model(BaseModel):
 
   def build(self, stats):
     # dnn frame level
-    self.spectograms_shape = (2050, )
+    self.spectograms_shape = (2050,)
     # dnn utterance level
     # self.fbanks_shape = (451, 21, 48)
     # dnn number of cells
-    self.n_cells = 4100
+    self.n_cells = np.prod(self.spectograms_shape)
+    self.n_classes = self.n_cells
     # batch size
     self.batch_size = 512 if self.is_training or self.is_testing else 1
-    self.keep_prob = 0.5 if self.is_training else 1.0
+    self.keep_prob = 1.0 if self.is_training else 1.0
     self.learning_rate = 1e-4
 
     # Build our dataflow graph.
@@ -36,21 +37,40 @@ class DNN2Model(BaseModel):
 
       GUESSES = self.ORG_GUESSES
       TRUTHS = self.ORG_TRUTHS
+      if self.is_training or self.is_testing:
+        # make them into "magnitude spectograms"
+        GUESSES = tf.abs(GUESSES)
+        TRUTHS = tf.abs(TRUTHS)
 
-      # make them into "magnitude spectograms"
-      GUESSES = tf.abs(GUESSES)
-      TRUTHS = tf.abs(TRUTHS)
+        # # normalize them based on each frames individual maximum
+        # self.max_array = tf.reduce_max(TRUTHS, axis=1, keep_dims=True)
+        # self.NORM_TRUTHS = TRUTHS / self.max_array
+        # self.NORM_GUESSES = GUESSES / self.max_array
+        #
+        # # handle NAN's (basically when the maximum in a frame is zero
+        # nan_truth_array = tf.is_nan(self.NORM_TRUTHS)
+        # self.CORRECTED_TRUTHS = tf.where(nan_truth_array, x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)], tf.float64), y=self.NORM_TRUTHS)
+        # nan_guess_array = tf.is_nan(self.NORM_GUESSES)
+        # self.CORRECTED_GUESSES = tf.where(nan_guess_array, x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)], tf.float64), y=self.NORM_GUESSES)
 
-      # normalize them based on each frames individual maximum
-      self.max_array = tf.reduce_max(TRUTHS, axis=1, keep_dims=True)
-      self.NORM_TRUTHS = TRUTHS / self.max_array
-      self.NORM_GUESSES = GUESSES / self.max_array
+        # normalize them based on each frames euclidean norm
+        self.truth_norm_array = tf.norm(TRUTHS, axis=1, keep_dims=True)
 
-      # handle NAN's (basically when the maximum in a frame is zero
-      nan_truth_array = tf.is_nan(self.NORM_TRUTHS)
-      self.CORRECTED_TRUTHS = tf.where(nan_truth_array, x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)]), y=self.NORM_TRUTHS)
-      nan_guess_array = tf.is_nan(self.NORM_GUESSES)
-      self.CORRECTED_GUESSES = tf.where(nan_guess_array, x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)]), y=self.NORM_GUESSES)
+        self.NORM_TRUTHS = TRUTHS / self.truth_norm_array
+
+        # handle NAN's (basically when the maximum in a frame is zero
+        nan_truth_array = tf.is_nan(self.NORM_TRUTHS)
+        self.CORRECTED_TRUTHS = tf.where(nan_truth_array, x=tf.zeros([self.batch_size, np.prod(self.spectograms_shape)], tf.float64), y=self.NORM_TRUTHS)
+        self.CORRECTED_GUESSES = GUESSES
+      else:
+        GUESSES = tf.abs(GUESSES)
+        TRUTHS = tf.abs(TRUTHS)
+
+        # normalize them based on each frames euclidean norm
+        self.TRUTH_NORM = tf.norm(GUESSES, axis=1, keep_dims=True)
+
+        self.CORRECTED_TRUTHS = TRUTHS
+        self.CORRECTED_GUESSES = GUESSES
 
       # Build feedforward layers.
       # This first layer is supposed to be a "locally_connected" layer however tensorflow doesn't have an implementation of that.
@@ -61,10 +81,8 @@ class DNN2Model(BaseModel):
       with tf.variable_scope('fully_connected_3') as scope:
         H_3 = fc_dropout_layer(H_2, self.n_cells, self.n_cells, scope, self.keep_prob, is_training=self.is_training, act_func=selu)
       with tf.variable_scope('fully_connected_4') as scope:
-        self.LOGITS = fc_layer(H_3, self.n_cells, np.prod(self.spectograms_shape), scope, is_training=self.is_training)
+        self.LOGITS = fc_layer(H_3, self.n_cells, self.n_classes, scope, is_training=self.is_training)
       self.Y = tf.nn.sigmoid(self.LOGITS)
-
-      print(self.LOGITS.shape)
 
       # Compute the cross entropy loss.
       self.COST = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
@@ -74,7 +92,7 @@ class DNN2Model(BaseModel):
       tf.summary.scalar("cost", self.COST)
 
       # Compute the accuracy
-      self.ACCURACY = tf.subtract(1.0, tf.reduce_mean(tf.multiply(tf.abs(tf.subtract(self.Y, self.CORRECTED_TRUTHS)), 10)))
+      self.ACCURACY = tf.subtract(tf.cast(1.0, tf.float64), tf.reduce_mean(tf.multiply(tf.abs(tf.subtract(self.Y, self.CORRECTED_TRUTHS)), 10)))
       tf.summary.scalar("accuracy", self.ACCURACY)
 
       # Compute gradients.

@@ -11,7 +11,7 @@ class DNN1ModelMultiGpu(BaseModel):
   def build(self, stats):
     # dnn frame level
     # self.spectograms_shape = (1025, )
-    self.spectograms_shape = (20, 1025)
+    self.spectograms_shape = (5, 1025)
     # dnn utterance level
     # self.fbanks_shape = (10, 48, 48)
     # dnn number of cells

@@ -13,7 +13,7 @@ from tensorflow.python.saved_model import signature_def_utils
 from tensorflow.python.saved_model import utils
 from tensorflow.python.saved_model import tag_constants
 import boto3
-from preprocessing import *
+from .preprocessing import *
 import requests
 
 
@@ -31,15 +31,13 @@ class BaseModel(object):
     self.is_validating = self.mode == 'val'
     self.input_file = input_file
     self.num_batches = 9 # int(num_of_examples/self.batch_size)
-    self.num_epochs = 10000
+    self.num_epochs = 3000
 
     self.input_pipeline_threads = 1
-    # self.graph_config = tf.ConfigProto(allow_soft_placement=True,
-    #                                    log_device_placement=False,
-    #                                    inter_op_parallelism_threads=5,
-    #                                    intra_op_parallelism_threads=2)
     self.graph_config = tf.ConfigProto(allow_soft_placement=True,
-                                       log_device_placement=False)
+                                       log_device_placement=False,
+                                       inter_op_parallelism_threads=5,
+                                       intra_op_parallelism_threads=2)
 
     print('building Model')
     self.build(stats)
@@ -87,7 +85,7 @@ class BaseModel(object):
         ACC = 0.0
         START_TIME = time.time()
         for MINI_BATCH in range(self.num_batches):
-          _, SUMMARIES, COST_VAL, ACC = SESSION.run([
+          _, SUMMARIES, COST_VAL, ACC, = SESSION.run([
             self.APPLY_GRADIENT_OP, self.SUMMARIES_OP, self.COST, self.ACCURACY
           ])
           ERROR += COST_VAL
@@ -116,7 +114,7 @@ class BaseModel(object):
       COORDINATOR.join(THREADS)
 
   # generate the training data for dnn2
-  def gen(self, gen_data_file, gen_meta_file, set_two_count):
+  def gen(self, gen_data_file, gen_meta_file, number_of_stacked_frames, set_two_count):
     print('generating data')
 
     writer = tf.python_io.TFRecordWriter(gen_data_file)
@@ -143,34 +141,13 @@ class BaseModel(object):
           self.Y, self.SPECTOGRAMS, self.MASKS
         ])
 
-        if (EPOCH % 500 == 0):
+        if (EPOCH % 100 == 0):
           print(EPOCH)
 
         for index, ESTIMATED_MASK in enumerate(ESTIMATED_MASKS):
-          # create the masks for nonvocal
-          estimated_nonvocal_mask = np.absolute(np.subtract(ESTIMATED_MASK, 1.0))
+          guessed_combo_matrix = self.single_mask_estimate(ESTIMATED_MASK, SPECTOGRAMS[index])
 
-          # create the guessed vocal and nonvocal combo matrix
-          guessed_vocals = np.multiply(ESTIMATED_MASK, SPECTOGRAMS[index])
-          guessed_nonvocals = np.multiply(estimated_nonvocal_mask, SPECTOGRAMS[index])
-          guessed_combo_matrix = np.concatenate((guessed_vocals, guessed_nonvocals))
-
-          # multiply by 2 to return to the correct comparable size
-          guessed_combo_matrix = np.multiply(guessed_combo_matrix, 2.0).flatten()
-
-          # create the ground truth combo matrix
-          # true_combo_matrix = np.concatenate((VOCALS, NONVOCALS), axis=1)
-
-          # create nonvocal truth masks
-          true_nonvocal_mask = np.absolute(np.subtract(MASKS[index], 1.0))
-
-          # create the true vocal and nonvocal combo matrix
-          true_vocals = np.multiply(MASKS[index], SPECTOGRAMS[index])
-          true_nonvocals = np.multiply(true_nonvocal_mask, SPECTOGRAMS[index])
-          true_combo_matrix = np.concatenate((true_vocals, true_nonvocals))
-
-          # multiply by 2 to create true combo matrix size
-          true_combo_matrix = np.multiply(true_combo_matrix, 2.0).flatten()
+          true_combo_matrix = self.single_mask_estimate(MASKS[index], SPECTOGRAMS[index])
 
           largest_guess = np.amax(np.absolute(guessed_combo_matrix))
           largest_truth = np.amax(np.absolute(true_combo_matrix))
@@ -180,15 +157,27 @@ class BaseModel(object):
           elif (largest_truth > HIGHEST_TRUTH):
             HIGHEST_TRUTH = largest_truth
 
-          guessed_combo_matrix = guessed_combo_matrix.astype(np.float32, copy=False)
-          true_combo_matrix = true_combo_matrix.astype(np.float32, copy=False)
+          guessed_combo_matrix = guessed_combo_matrix.astype(np.float64, copy=False)
+          true_combo_matrix = true_combo_matrix.astype(np.float64, copy=False)
 
-          # Write the final input frames and binary_mask to disk.
-          example = tf.train.Example(features=tf.train.Features(feature={
-            'guess': bytes_feature(guessed_combo_matrix.flatten().tostring()),
-            'truth': bytes_feature(true_combo_matrix.flatten().tostring())
-          }))
-          writer.write(example.SerializeToString())
+          vocal_matrix, nonvocal_matrix = np.split(guessed_combo_matrix, 2, axis=0)
+          vocal_matrices = np.split(vocal_matrix, number_of_stacked_frames, axis=0)
+          nonvocal_matrices = np.split(nonvocal_matrix, number_of_stacked_frames, axis=0)
+
+          true_vocal_matrix, true_nonvocal_matrix = np.split(true_combo_matrix, 2, axis=0)
+          true_vocal_matrices = np.split(true_vocal_matrix, number_of_stacked_frames, axis=0)
+          true_nonvocal_matrices = np.split(true_nonvocal_matrix, number_of_stacked_frames, axis=0)
+
+          for innerindex, matrix in enumerate(vocal_matrices):
+            guessed_combo_matrix = np.concatenate((matrix, nonvocal_matrices[innerindex]), axis=0)
+            true_combo_matrix = np.concatenate((true_vocal_matrices[innerindex], true_nonvocal_matrices[innerindex]), axis=0)
+
+            # Write the final input frames and binary_mask to disk.
+            example = tf.train.Example(features=tf.train.Features(feature={
+              'guess': bytes_feature(guessed_combo_matrix.flatten().tostring()),
+              'truth': bytes_feature(true_combo_matrix.flatten().tostring())
+            }))
+            writer.write(example.SerializeToString())
 
       print('highest guess')
       print(HIGHEST_GUESS)
@@ -216,37 +205,43 @@ class BaseModel(object):
       COMBO_MATRICES = []
       VOCALS = []
       NONVOCALS = []
+      # PHASE_INDEXS = [1024, 2049, 3074, 4099, 5124]
       PHASE_COMPONENTS = []
 
       print('size')
       print(len(SPECTOGRAMS))
 
-      for SPECTOGRAM in SPECTOGRAMS:
+      for index, SPECTOGRAM in enumerate(SPECTOGRAMS):
         mask = SESSION.run(self.Y, feed_dict={self.spectograms: [SPECTOGRAM]})
         ESTIMATED_MASKS.append(mask)
-        PHASE_COMPONENTS.append(SPECTOGRAM[-1].astype(np.float32))
+        # PHASE_COMPONENTS.append([])
+        # for component_idx in PHASE_INDEXS:
+        #   PHASE_COMPONENTS[index].append(SPECTOGRAM[component_idx].astype(np.float64))
+
+        if (index % 100 == 0):
+          print(index)
 
       for index, ESTIMATED_MASK in enumerate(ESTIMATED_MASKS):
-        # create the masks for nonvocal
-        estimated_nonvocal_mask = np.absolute(np.subtract(ESTIMATED_MASK, 1.0))
 
-        # create the guessed vocal and nonvocal combo matrix
-        guessed_vocals = np.multiply(ESTIMATED_MASK, SPECTOGRAMS[index])
-        guessed_nonvocals = np.multiply(estimated_nonvocal_mask, SPECTOGRAMS[index])
-        guessed_combo_matrix = np.concatenate((guessed_vocals, guessed_nonvocals))
+        guessed_combo_matrix = self.single_mask_estimate(ESTIMATED_MASK, SPECTOGRAMS[index])
 
-        # multiply by 2 to return to the correct comparable size
-        guessed_combo_matrix = np.multiply(guessed_combo_matrix, 2.0).flatten()
-        guessed_combo_matrix = guessed_combo_matrix.astype(np.float32, copy=False)
-        COMBO_MATRICES.append(guessed_combo_matrix)
+        guessed_combo_matrix = guessed_combo_matrix.astype(np.float64, copy=False)
 
         vocal_matrix, nonvocal_matrix = np.split(guessed_combo_matrix, 2, axis=0)
-        vocal_matrix = np.array([vocal_matrix], dtype=np.float32)
-        nonvocal_matrix = np.array([nonvocal_matrix], dtype=np.float32)
-        vocal_matrix[0][-1] = PHASE_COMPONENTS[index]
-        nonvocal_matrix[0][-1] = PHASE_COMPONENTS[index]
-        VOCALS.append(vocal_matrix)
-        NONVOCALS.append(nonvocal_matrix)
+        vocal_matrices = np.split(vocal_matrix, configs['STACKED_FRAMES'], axis=0)
+        nonvocal_matrices = np.split(nonvocal_matrix, configs['STACKED_FRAMES'], axis=0)
+
+        for innerindex, vocal_matrix in enumerate(vocal_matrices):
+          guessed_combo_matrix = np.concatenate((vocal_matrix, nonvocal_matrices[innerindex]), axis=0)
+          COMBO_MATRICES.append(guessed_combo_matrix)
+
+          vocal_matrix = np.array([vocal_matrix], dtype=np.float64)
+          nonvocal_matrix = np.array([nonvocal_matrices[innerindex]], dtype=np.float64)
+          # vocal_matrix[0][-1] = PHASE_COMPONENTS[index][innerindex]
+          # nonvocal_matrix[0][-1] = PHASE_COMPONENTS[index][innerindex]
+
+          VOCALS.append(vocal_matrix)
+          NONVOCALS.append(nonvocal_matrix)
 
       VOCAL_FRAMES = np.concatenate(VOCALS).T
       NONVOCAL_FRAMES = np.concatenate(NONVOCALS).T
@@ -258,10 +253,32 @@ class BaseModel(object):
       VOCAL_SIGNALS = istft(VOCAL_FRAMES, configs=configs)
       NONVOCAL_SIGNALS = istft(NONVOCAL_FRAMES, configs=configs)
 
-      librosa.output.write_wav("vocal1.wav", VOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
-      librosa.output.write_wav("nonvocal1.wav", NONVOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
+      librosa.output.write_wav("vocal4.wav", VOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
+      librosa.output.write_wav("nonvocal4.wav", NONVOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
 
       return COMBO_MATRICES, PHASE_COMPONENTS
+
+  def single_mask_estimate(self, estimated_mask, spectogram):
+    # create the masks for nonvocal
+    estimated_nonvocal_mask = np.absolute(np.subtract(estimated_mask, 1.0))
+
+    # create the guessed vocal and nonvocal combo matrix
+    guessed_vocals = np.multiply(estimated_mask, spectogram)
+    guessed_nonvocals = np.multiply(estimated_nonvocal_mask, spectogram)
+    guessed_combo_matrix = np.concatenate((guessed_vocals, guessed_nonvocals))
+
+    return guessed_combo_matrix.flatten()
+
+  def dual_mask_estimate(self, estimated_mask, spectogram):
+    # create the masks for nonvocal
+    vocal_guessed_mask, nonvocal_guessed_mask = np.split(estimated_mask[0], 2, axis=0)
+
+    # create the guessed vocal and nonvocal combo matrix
+    guessed_vocals = np.multiply(vocal_guessed_mask, spectogram)
+    guessed_nonvocals = np.multiply(nonvocal_guessed_mask, spectogram)
+    guessed_combo_matrix = np.concatenate((guessed_vocals, guessed_nonvocals))
+
+    return guessed_combo_matrix.flatten()
 
   def refine_matrices_and_output(self, combo_matrices, phase_components, configs, stats):
     print('Getting input for Second Model')
@@ -280,23 +297,20 @@ class BaseModel(object):
       print(len(combo_matrices))
 
       for index, combo_matrix in enumerate(combo_matrices):
-        sign_matrix = np.sign(combo_matrix)
-        norm_combo_matrix = np.absolute(combo_matrix)
+        sign_matrix = np.sign([combo_matrix])
 
-        max_matrix = np.amax(norm_combo_matrix)
-        corrected_combo_matrix = norm_combo_matrix / max_matrix
+        # max_matrix = np.amax(norm_combo_matrix)
+        # corrected_combo_matrix = norm_combo_matrix / max_matrix
 
-        refined_matrix, original = SESSION.run([self.Y, self.ORG_GUESSES], feed_dict={self.guesses: [corrected_combo_matrix]})
-        refined_matrix = np.multiply(refined_matrix, max_matrix)
+        refined_matrix, norm_array = SESSION.run([self.Y, self.TRUTH_NORM], feed_dict={self.guesses: [combo_matrix]})
         refined_matrix = np.multiply(refined_matrix, sign_matrix)
+        refined_matrix = np.multiply(refined_matrix, norm_array)
         vocal_matrix, nonvocal_matrix = np.split(refined_matrix, 2, axis=1)
-        vocal_matrix[0][-1] = phase_components[index]
-        nonvocal_matrix[0][-1] = phase_components[index]
+        # vocal_matrix[0][-1] = phase_components[index]
+        # nonvocal_matrix[0][-1] = phase_components[index]
         VOCAL_FRAMES.append(vocal_matrix)
         NONVOCAL_FRAMES.append(nonvocal_matrix)
         if (index % 100 == 0):
-          print(combo_matrix)
-          print(refined_matrix)
           print(index)
 
     VOCAL_FRAMES = np.concatenate(VOCAL_FRAMES).T
@@ -309,8 +323,8 @@ class BaseModel(object):
     VOCAL_SIGNALS = istft(VOCAL_FRAMES, configs=configs)
     NONVOCAL_SIGNALS = istft(NONVOCAL_FRAMES, configs=configs)
 
-    librosa.output.write_wav("vocal2.wav", VOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
-    librosa.output.write_wav("nonvocal2.wav", NONVOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
+    librosa.output.write_wav("vocalfinished4.wav", VOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
+    librosa.output.write_wav("nonvocalfinished4.wav", NONVOCAL_SIGNALS, sr=configs['SAMPLE_RATE'])
 
   # get test accuracies of models
   def test(self):
@@ -414,9 +428,9 @@ class BaseModel(object):
           'truth': tf.FixedLenFeature([], tf.string)
         })
         # Decode sample
-        guesses = tf.decode_raw(features['guess'], tf.float32)
+        guesses = tf.decode_raw(features['guess'], tf.float64)
         guesses.set_shape(spectograms_shape)
-        truths = tf.decode_raw(features['truth'], tf.float32)
+        truths = tf.decode_raw(features['truth'], tf.float64)
         truths.set_shape(spectograms_shape)
 
         self.guesses, self.truths = tf.train.shuffle_batch(
@@ -425,7 +439,7 @@ class BaseModel(object):
         )
       else:
         spectograms_shape = [None] + spectograms_shape
-        self.guesses = tf.placeholder(tf.float32, shape=spectograms_shape)
-        self.truths = tf.placeholder(tf.float32, shape=spectograms_shape)
+        self.guesses = tf.placeholder(tf.float64, shape=spectograms_shape)
+        self.truths = tf.placeholder(tf.float64, shape=spectograms_shape)
 
       return self.guesses, self.truths

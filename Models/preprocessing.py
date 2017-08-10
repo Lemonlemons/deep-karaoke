@@ -3,9 +3,6 @@ import requests
 
 import os
 
-from audioread import NoBackendError
-import audioread
-
 import numpy as np
 import tensorflow as tf
 
@@ -35,7 +32,7 @@ def prepare_train_and_test_data(configs, args):
     # first_count = prepare_karaoke_tfrecord(train_one_path, configs, 0, 75, 30)
     # second_count = prepare_karaoke_tfrecord(train_two_path, configs, 75, 150, 105, second_set=True)
     first_count = prepare_karaoke_tfrecord(train_one_path, configs, 0, 45, 0)
-    second_count = prepare_karaoke_tfrecord(train_two_path, configs, 45, 90, 0)
+    second_count = prepare_karaoke_tfrecord(train_two_path, configs, 45, 90, 0, second_set=True)
 
     # if not os.path.exists(val_path):
     # Write the testing set.
@@ -61,12 +58,22 @@ def prepare_train_and_test_data(configs, args):
 def prepare_val_data(configs):
 
   samples, _ = librosa.load(configs['TEST_FILE'], sr=configs['SAMPLE_RATE'], mono=True)
-  true_mix = np.array(samples, dtype=np.float32)
+  true_mix = np.array(samples, dtype=np.float64)
   true_mix_stft = stft(true_mix, configs).T
 
+  hop_sample = configs['STACKED_FRAMES']
+  print("before")
+  print(true_mix_stft.shape)
+  mix_frames = sample_frames(true_mix_stft, configs['STACKED_FRAMES'], hop_sample)
+  mix_frames = np.reshape(mix_frames, (len(mix_frames), configs['WINDOW_SIZE']))
+
   stats = get_stats(configs['TF_RECORDS_META'])
+
+  print("after")
+  print(mix_frames.shape)
+
   print('loaded validation data')
-  return stats, true_mix_stft
+  return stats, mix_frames
 
 def bytes_feature(value):
   '''
@@ -152,15 +159,18 @@ def prepare_karaoke_tfrecord(set_path, configs, set_start_int, set_stop_int, dat
         else:
           nonvocal_stems.append(samples)
 
-    vocal_stems = np.array(vocal_stems)
-    nonvocal_stems = np.array(nonvocal_stems)
+    # removing the complex portion of the data
+    vocal_stems = np.array(vocal_stems, dtype=np.float64)
+    nonvocal_stems = np.array(nonvocal_stems, dtype=np.float64)
     vocal_mix = mix_stems(vocal_stems)
     nonvocal_mix = mix_stems(nonvocal_stems)
     true_mix = np.add(np.multiply(vocal_mix, 0.5), np.multiply(nonvocal_mix, 0.5))
 
     vocal_stft = stft(vocal_mix, configs).T
     nonvocal_stft = stft(nonvocal_mix, configs).T
-    true_mix_stft = stft(true_mix, configs).T
+    # original used (about half the volume of new version, perhaps doesn't matter, see orig vs research)
+    # true_mix_stft = stft(true_mix, configs).T
+    true_mix_stft = np.add(vocal_stft, nonvocal_stft)
 
     # removing the complex portion of the data
     vocal_stft = np.array(vocal_stft, dtype=np.float64)
@@ -196,31 +206,35 @@ def prepare_karaoke_tfrecord(set_path, configs, set_start_int, set_stop_int, dat
     true_mix_stft = np.delete(true_mix_stft, mask_indexs_to_remove, 0)
     true_masks = np.delete(true_masks, mask_indexs_to_remove, 0)
 
-    # pre-update
+    print('after')
+    print(true_mix_stft.shape)
+    print(true_masks.shape)
+
     hop_sample = configs['SAMPLE_HOP']
 
     mask_frames = sample_frames(true_masks, configs['STACKED_FRAMES'], hop_sample)
     mix_frames = sample_frames(true_mix_stft, configs['STACKED_FRAMES'], hop_sample)
 
-    mask_frames = np.reshape(mask_frames, (len(mask_frames), 20500))
-    mix_frames = np.reshape(mix_frames, (len(mix_frames), 20500))
+    mask_frames = np.reshape(mask_frames, (len(mask_frames), configs['WINDOW_SIZE']))
+    mix_frames = np.reshape(mix_frames, (len(mix_frames), configs['WINDOW_SIZE']))
 
     # important to notice that we're saving the non-absolute values
     # VOCAL_FRAMES.append(vocal_stft)
     # NONVOCAL_FRAMES.append(nonvocal_stft)
     # MIX_FRAMES.append(true_mix_stft)
     # MASKS.append(true_masks)
-    print('after')
-    print(mix_frames.shape)
+
+    print("reshape")
     print(mask_frames.shape)
+    print(mix_frames.shape)
 
-    count += len(true_mix_stft)
+    count += len(mix_frames)
 
-    for innerindex, window in enumerate(true_mix_stft):
+    for innerindex, window in enumerate(mix_frames):
       # Write the final input frames and binary_mask to disk.
       example = tf.train.Example(features=tf.train.Features(feature={
         'spectograms': bytes_feature(window.flatten().tostring()),
-        'masks': bytes_feature(true_masks[innerindex].flatten().tostring())
+        'masks': bytes_feature(mask_frames[innerindex].flatten().tostring())
       }))
       writer.write(example.SerializeToString())
 
@@ -280,11 +294,10 @@ def mix_stems_max(stems):
   return mix
 
 def sample_frames(X, L, H):
-  n_hops = np.round((X.shape[0] - L) / H)
+  n_hops = int(np.round((X.shape[0] - L) / H))
   Y = []
   for hop in range(n_hops):
     hop_start = (hop * H)
     chunk = X[hop_start:hop_start + L, :]
     Y.append(chunk)
   return np.array(Y, dtype=np.float64)
-
